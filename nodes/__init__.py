@@ -6,6 +6,7 @@ from .inference_node import GVHMRInference
 from .save_smpl_node import SaveSMPL
 from .load_smpl_node import LoadSMPLParams as LoadSMPL
 from .load_camera_trajectory_node import LoadCameraTrajectory
+from .nuke_camera_node import LoadNukeCamera
 from .fbx_loader_node import LoadFBXCharacter
 from .fbx_preview_node import FBXPreview
 from .fbx_animation_viewer_node import FBXAnimationViewer
@@ -37,6 +38,7 @@ NODE_CLASS_MAPPINGS = {
     "SaveSMPL": SaveSMPL,
     "LoadSMPL": LoadSMPL,
     "LoadCameraTrajectory": LoadCameraTrajectory,
+    "LoadNukeCamera": LoadNukeCamera,
     "LoadFBXCharacter": LoadFBXCharacter,
     "FBXPreview": FBXPreview,
     "FBXAnimationViewer": FBXAnimationViewer,
@@ -65,6 +67,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SaveSMPL": "Save SMPL Motion",
     "LoadSMPL": "Load SMPL Params",
     "LoadCameraTrajectory": "Load Camera Trajectory",
+    "LoadNukeCamera": "Load Nuke Camera (.chan)",
     "LoadFBXCharacter": "Load FBX Character",
     "FBXPreview": "FBX 3D Preview",
     "FBXAnimationViewer": "FBX Animation Viewer",

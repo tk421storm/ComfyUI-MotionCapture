@@ -260,6 +260,9 @@ class GVHMRInference(io.ComfyNode):
                 io.Custom("INTRINSICS").Input("intrinsics",
                     tooltip="Camera intrinsics matrix (3x3). Connect from DepthAnything V3 or other source. Overrides focal_length_mm if provided.",
                     optional=True),
+                io.Custom("CAMERA_TRACK").Input("camera_track",
+                    tooltip="Tracked camera (e.g. Load Nuke Camera). Replaces intrinsics/focal_length_mm, and replaces visual odometry when moving_camera is on.",
+                    optional=True),
                 io.Int.Input("chunk_size", default=32, min=1, max=200, step=1,
                     tooltip="Frames per chunk during preprocessing. Higher = faster but uses more RAM. Lower = slower but saves RAM. 32 is a good default, use 10-16 if low on RAM.",
                     optional=True),
@@ -417,6 +420,7 @@ class GVHMRInference(io.ComfyNode):
         intrinsics: torch.Tensor = None,
         dpvo_dir: str = "",
         chunk_size: int = 32,
+        camera_track: Dict = None,
     ) -> Dict:
         """
         Prepare data dictionary for GVHMR inference from VIDEO inputs.
@@ -440,6 +444,8 @@ class GVHMRInference(io.ComfyNode):
         Log.info(f"[GVHMRInference] Video: {video_frame_count} frames @ {width}x{height}")
         Log.info(f"[GVHMRInference] Mask: {mask_frame_count} frames @ {mask_width}x{mask_height}")
         Log.info(f"[GVHMRInference] Processing {batch_size} frames, static_camera={static_camera}")
+        if camera_track is not None and len(camera_track["R_w2c"]) < batch_size:
+            raise ValueError(f"camera_track has {len(camera_track['R_w2c'])} frames but the video has {batch_size}")
         _log_memory("Start of prepare_data_from_videos")
 
         # --- Phase 1: Extract bounding boxes from mask video ---
@@ -505,7 +511,7 @@ class GVHMRInference(io.ComfyNode):
         # For moving camera: write temp video incrementally
         temp_video_path = None
         _video_writer = None
-        if not static_camera:
+        if not static_camera and camera_track is None:
             import tempfile
             temp_video_path = tempfile.mktemp(suffix=".mp4")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -607,8 +613,17 @@ class GVHMRInference(io.ComfyNode):
             _clear_cuda_memory()
             Log.info("[GVHMRInference] Features moved to CPU, GPU memory cleared")
 
-        # Camera intrinsics: use provided K, or estimate from focal_length_mm, or auto-estimate
-        if intrinsics is not None:
+        # Camera intrinsics: use tracked camera, provided K, focal_length_mm, or auto-estimate
+        if camera_track is not None:
+            # Nuke fits haperture to the plate width
+            f_px = camera_track["focal_mm"][:batch_size] / camera_track["haperture"] * width
+            K_fullimg = torch.eye(3).repeat(batch_size, 1, 1)
+            K_fullimg[:, 0, 0] = f_px
+            K_fullimg[:, 1, 1] = f_px
+            K_fullimg[:, 0, 2] = width / 2
+            K_fullimg[:, 1, 2] = height / 2
+            Log.info(f"[GVHMRInference] Using camera_track intrinsics, fx={f_px[0]:.1f}")
+        elif intrinsics is not None:
             Log.info(f"[GVHMRInference] Using provided camera intrinsics, input shape: {intrinsics.shape}")
             # Squeeze extra dimensions (DA3 outputs [1, 1, 3, 3])
             K = intrinsics.squeeze()
@@ -637,6 +652,10 @@ class GVHMRInference(io.ComfyNode):
         t_w2c = None  # Camera translation
         if static_camera:
             R_w2c = torch.eye(3).repeat(batch_size, 1, 1)
+        elif camera_track is not None:
+            Log.info("[GVHMRInference] Using camera_track instead of visual odometry")
+            R_w2c = camera_track["R_w2c"][:batch_size]
+            t_w2c = camera_track["t_w2c"][:batch_size]
         else:
             # Run visual odometry to estimate camera motion
             try:
@@ -739,6 +758,7 @@ class GVHMRInference(io.ComfyNode):
         vo_scale: float = 0.5,
         vo_step: int = 8,
         intrinsics: torch.Tensor = None,
+        camera_track: Dict = None,
         chunk_size: int = 32,
     ):
         """
@@ -773,7 +793,7 @@ class GVHMRInference(io.ComfyNode):
 
             # Prepare data (reads frames from video files chunk-by-chunk)
             data, camera_data = cls.prepare_data_from_videos(
-                video, video_mask, model, static_camera, focal_length_mm, bbox_scale, vo_method, vo_scale, vo_step, intrinsics, dpvo_dir, chunk_size
+                video, video_mask, model, static_camera, focal_length_mm, bbox_scale, vo_method, vo_scale, vo_step, intrinsics, dpvo_dir, chunk_size, camera_track
             )
 
             batch_size_saved = data["length"].item()
@@ -837,6 +857,12 @@ class GVHMRInference(io.ComfyNode):
             t_w2c = camera_data["t_w2c"]
             K_fullimg_out = camera_data["K_fullimg"]
             img_height, img_width = img_height_saved, img_width_saved
+            K_np = K_fullimg_out.cpu().numpy().astype(np.float32) if isinstance(K_fullimg_out, torch.Tensor) else np.array(K_fullimg_out, dtype=np.float32)
+            # Intrinsics are saved for static camera too, so exporters can
+            # rebuild the camera from the incam params.
+            save_dict['K_fullimg'] = K_np
+            save_dict['img_width'] = np.array([img_width])
+            save_dict['img_height'] = np.array([img_height])
 
             if not static_camera and t_w2c is not None:
                 # Compute camera-to-world transform in gravity-aligned (GV) frame
@@ -852,7 +878,6 @@ class GVHMRInference(io.ComfyNode):
 
                 R_cam2world_np = R_cam2world.cpu().numpy().astype(np.float32)
                 t_cam2world_np = t_cam2world.cpu().numpy().astype(np.float32)
-                K_np = K_fullimg_out.cpu().numpy().astype(np.float32) if isinstance(K_fullimg_out, torch.Tensor) else np.array(K_fullimg_out, dtype=np.float32)
 
                 Log.info(f"[GVHMRInference] Camera trajectory: R_cam2world {R_cam2world_np.shape}, t_cam2world {t_cam2world_np.shape}")
                 Log.info(f"[GVHMRInference] Camera pos frame 0: [{t_cam2world_np[0,0]:.3f}, {t_cam2world_np[0,1]:.3f}, {t_cam2world_np[0,2]:.3f}]")
@@ -860,9 +885,6 @@ class GVHMRInference(io.ComfyNode):
                 # Add camera data to main NPZ
                 save_dict['R_cam2world'] = R_cam2world_np
                 save_dict['t_cam2world'] = t_cam2world_np
-                save_dict['K_fullimg'] = K_np
-                save_dict['img_width'] = np.array([img_width])
-                save_dict['img_height'] = np.array([img_height])
 
                 # Also save separate camera NPZ
                 camera_npz_filename = _next_sequential_filename(output_dir, "camera_trajectory", ".npz")

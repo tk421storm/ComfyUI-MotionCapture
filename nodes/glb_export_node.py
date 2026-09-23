@@ -156,6 +156,14 @@ class SMPLToGLB(io.ComfyNode):
                                 tooltip="Path to .npz file with SMPL parameters (from GVHMR Inference)"),
                 io.Int.Input("fps", default=30, min=1, max=120, step=1,
                              tooltip="Animation frames per second", optional=True),
+                io.Int.Input("start_frame", default=0, min=0, max=100000, step=1, optional=True,
+                             tooltip="Frame of the first key (e.g. 1001 to match a plate). Importers like Blender place glTF time 0 at frame 0."),
+                io.String.Input("output_path", default="", multiline=False, optional=True,
+                                tooltip="Where to write the .glb. Relative paths are inside the ComfyUI output folder. Empty = output/smpl_anim_XXXX.glb"),
+                io.Custom("CAMERA_TRACK").Input("camera_track", optional=True,
+                    tooltip="Tracked camera (e.g. Load Nuke Camera). Exports the body and camera in the tracker's scene instead of GVHMR's world."),
+                io.Float.Input("scene_scale", default=1.0, min=0.0001, max=10000.0, step=0.01, optional=True,
+                    tooltip="Scene units per meter for camera_track. Only changes how big and far the body is in the scene, not how it lines up through the camera."),
             ],
             outputs=[
                 io.String.Output(display_name="glb_path"),
@@ -163,7 +171,7 @@ class SMPLToGLB(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, npz_path="", fps=30):
+    def execute(cls, npz_path="", fps=30, start_frame=0, output_path="", camera_track=None, scene_scale=1.0):
         if not npz_path or not npz_path.strip():
             raise ValueError("npz_path is required")
         npz_file = Path(npz_path)
@@ -232,6 +240,43 @@ class SMPLToGLB(io.ComfyNode):
             ibms[j] = np.eye(4, dtype=np.float32)
             ibms[j, :3, 3] = -J[j].astype(np.float32)
 
+        # ---- Camera ----
+        # GVHMR gives the same body in world (global) and camera (incam, OpenCV
+        # axes) space. SMPL rotates about J[0], so a camera-space point x_c maps
+        # to world as R_cam2world (x_c - J0 - t_incam) + J0 + t_global.
+        D = np.diag([1.0, -1.0, -1.0])  # OpenCV (+Z forward, +Y down) <-> glTF (-Z forward, +Y up)
+        armature_scale = None
+        if camera_track is not None:
+            if 'global_orient_incam' not in data or 'img_width' not in data:
+                raise ValueError("camera_track needs an NPZ from the current GVHMR Inference (incam params + image size)")
+            if len(camera_track["R_w2c"]) < num_frames:
+                raise ValueError(f"camera_track has {len(camera_track['R_w2c'])} frames but the NPZ has {num_frames}")
+            # Place the incam body through the tracked camera instead of GVHMR's world.
+            # The armature is scaled by scene_scale so GVHMR's meters become scene
+            # units, while the camera stays at its tracked position:
+            #   world = scene_scale * R_cam2world @ x_c + cam_pos
+            R_cam2world = np.transpose(camera_track["R_w2c"][:num_frames].numpy().astype(np.float64), (0, 2, 1))
+            cam_pos = -np.einsum('fij,fj->fi', R_cam2world, camera_track["t_w2c"][:num_frames].numpy())
+            global_orient = (R.from_matrix(R_cam2world) * R.from_rotvec(data['global_orient_incam'])).as_rotvec()
+            transl = np.einsum('fij,fj->fi', R_cam2world, J[0] + data['transl_incam']) + cam_pos / scene_scale - J[0]
+            armature_scale = [scene_scale] * 3
+            img_w, img_h = int(data['img_width'][0]), int(data['img_height'][0])
+            # Nuke fits haperture to the plate width
+            f_px = float(camera_track["focal_mm"][0]) / camera_track["haperture"] * img_w
+            has_camera = True
+        else:
+            has_camera = 'global_orient_incam' in data and 'K_fullimg' in data
+            if has_camera:
+                R_cam2world = (R.from_rotvec(global_orient) * R.from_rotvec(data['global_orient_incam']).inv()).as_matrix()
+                cam_pos = J[0] + transl - np.einsum('fij,fj->fi', R_cam2world, J[0] + data['transl_incam'])
+                img_w, img_h = int(data['img_width'][0]), int(data['img_height'][0])
+                f_px = float(data['K_fullimg'].reshape(-1, 3, 3)[0, 1, 1])
+            else:
+                logger.info("[SMPLToGLB] NPZ has no incam params or intrinsics, exporting without camera")
+        if has_camera:
+            cam_pos = cam_pos.astype(np.float32)
+            cam_quats = R.from_matrix(R_cam2world @ D).as_quat().astype(np.float32)
+
         # ---- Animation data ----
         # Combine global_orient + body_pose -> (F, 22, 3) axis-angle
         full_pose = np.concatenate([
@@ -240,7 +285,7 @@ class SMPLToGLB(io.ComfyNode):
         ], axis=1).astype(np.float64)  # (F, 22, 3)
 
         quats = _axis_angle_to_quat(full_pose)  # (F, 22, 4) in (x,y,z,w)
-        timestamps = (np.arange(num_frames, dtype=np.float32) / fps)
+        timestamps = ((np.arange(num_frames) + start_frame) / fps).astype(np.float32)
         # Root translation = skeleton root position + transl offset
         # In SMPL, transl is added on top of FK output: verts = LBS(...) + transl
         # In glTF, the animated translation REPLACES the node's rest translation (J[0])
@@ -348,6 +393,11 @@ class SMPLToGLB(io.ComfyNode):
             q_acc = add_accessor(q_bv, CT_FLOAT, num_frames, "VEC4")
             rot_accs.append(q_acc)
 
+        # 10. Camera translations + rotations
+        if has_camera:
+            cam_tl_acc = add_accessor(add_buffer_view(cam_pos.tobytes()), CT_FLOAT, num_frames, "VEC3")
+            cam_rot_acc = add_accessor(add_buffer_view(cam_quats.tobytes()), CT_FLOAT, num_frames, "VEC4")
+
         # ---- Build glTF JSON ----
         # Nodes: 0 = armature root, 1..22 = joint nodes, 23 = mesh node
         # Joint nodes are arranged so node index = joint_index + 1
@@ -363,6 +413,8 @@ class SMPLToGLB(io.ComfyNode):
             "name": "Armature",
             "children": armature_children,
         })
+        if armature_scale is not None:
+            nodes[0]["scale"] = armature_scale
 
         # Nodes 1..22: Joint nodes
         for j in range(NUM_JOINTS):
@@ -451,6 +503,16 @@ class SMPLToGLB(io.ComfyNode):
                 },
             })
 
+        scene_nodes = [0]
+        if has_camera:
+            # Node 24: Camera, animated in the same world space as the armature
+            cam_node = len(nodes)
+            nodes.append({"name": "Camera", "camera": 0})
+            scene_nodes.append(cam_node)
+            for path, acc in (("translation", cam_tl_acc), ("rotation", cam_rot_acc)):
+                channels.append({"sampler": len(samplers), "target": {"node": cam_node, "path": path}})
+                samplers.append({"input": ts_acc, "output": acc, "interpolation": "LINEAR"})
+
         animation = {
             "name": "SMPLAnimation",
             "samplers": samplers,
@@ -461,7 +523,7 @@ class SMPLToGLB(io.ComfyNode):
         gltf = {
             "asset": {"version": "2.0", "generator": "ComfyUI-MotionCapture"},
             "scene": 0,
-            "scenes": [{"nodes": [0], "name": "Scene"}],
+            "scenes": [{"nodes": scene_nodes, "name": "Scene"}],
             "nodes": nodes,
             "meshes": [mesh],
             "skins": [skin],
@@ -470,18 +532,35 @@ class SMPLToGLB(io.ComfyNode):
             "bufferViews": buffer_views,
             "buffers": [{"byteLength": len(buf)}],
         }
+        if has_camera:
+            # glTF has no principal point, so cx/cy offsets from the image center are dropped
+            gltf["cameras"] = [{
+                "name": "Camera",
+                "type": "perspective",
+                "perspective": {
+                    "aspectRatio": img_w / img_h,
+                    "yfov": float(2 * np.arctan(img_h / (2 * f_px))),
+                    "znear": 0.01,
+                    "zfar": 1000.0,
+                },
+            }]
 
         # ---- Write GLB ----
         glb_bytes = _build_glb(gltf, bytes(buf))
 
         output_dir = Path(folder_paths.get_output_directory())
-        glb_filename = next_sequential_filename(output_dir, "smpl_anim", ".glb")
-        glb_path = output_dir / glb_filename
+        if output_path.strip():
+            glb_path = output_dir / output_path.strip()  # absolute paths replace output_dir
+            if glb_path.suffix.lower() != ".glb":
+                glb_path = glb_path.with_name(glb_path.name + ".glb")
+            glb_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            glb_path = output_dir / next_sequential_filename(output_dir, "smpl_anim", ".glb")
         with open(glb_path, "wb") as f:
             f.write(glb_bytes)
 
         size_mb = glb_path.stat().st_size / (1024 * 1024)
-        logger.info(f"[SMPLToGLB] Wrote {glb_filename} ({size_mb:.1f} MB) -- "
+        logger.info(f"[SMPLToGLB] Wrote {glb_path} ({size_mb:.1f} MB) -- "
                      f"{num_frames} frames, {NUM_JOINTS} joints, "
                      f"{len(positions)} vertices, {len(faces)} faces")
 

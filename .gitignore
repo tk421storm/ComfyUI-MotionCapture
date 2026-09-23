@@ -45,6 +45,7 @@ pixi.lock
 _env_*
 .comfy-env-marker.toml
 
-# Built web assets
-web/
+# Built web assets (copied in by comfy_3d_viewers at startup); hand-written extensions go in web/nodes/
+web/*
+!web/nodes/
 
