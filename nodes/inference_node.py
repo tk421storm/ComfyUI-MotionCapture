@@ -872,8 +872,11 @@ class GVHMRInference(io.ComfyNode):
                 R_body_world = axis_angle_to_matrix(global_params['global_orient'])  # (F, 3, 3)
                 R_body_cam = axis_angle_to_matrix(incam_params['global_orient'])     # (F, 3, 3)
                 R_cam2world = R_body_world @ R_body_cam.transpose(-1, -2)            # (F, 3, 3)
-                t_cam2world = global_params['transl'] - torch.bmm(
-                    R_cam2world, incam_params['transl'].unsqueeze(-1)
+                # SMPL-X rotates about the pelvis J0, not the origin:
+                # x_world = R_cam2world (x_cam - J0 - t_incam) + J0 + t_global
+                J0 = make_smplx("supermotion").get_skeleton(global_params['betas'].cpu())[:, 0]  # (F, 3)
+                t_cam2world = J0 + global_params['transl'].cpu() - torch.bmm(
+                    R_cam2world.cpu(), (J0 + incam_params['transl'].cpu()).unsqueeze(-1)
                 ).squeeze(-1)  # (F, 3)
 
                 R_cam2world_np = R_cam2world.cpu().numpy().astype(np.float32)
