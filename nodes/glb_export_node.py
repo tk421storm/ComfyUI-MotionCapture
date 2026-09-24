@@ -98,6 +98,26 @@ def _axis_angle_to_quat(aa):
     return quats
 
 
+def _lowest_skinned_y(full_pose, J, rest_verts, joint_indices, joint_weights):
+    """Per-frame min Y of the skinned mesh, with the root joint at J[0] and no transl."""
+    import comfy.model_management
+    F = full_pose.shape[0]
+    G = R.from_rotvec(full_pose.reshape(-1, 3)).as_matrix().reshape(F, NUM_JOINTS, 3, 3)
+    p = np.zeros((F, NUM_JOINTS, 3))
+    p[:, 0] = J[0]
+    for j in range(1, NUM_JOINTS):
+        parent = SMPL_21_PARENTS[j]
+        p[:, j] = p[:, parent] + G[:, parent] @ (J[j] - J[parent])
+        G[:, j] = G[:, parent] @ G[:, j]
+    lowest = np.empty(F)
+    local = rest_verts[:, None, :] - J[joint_indices]  # (V, 4, 3)
+    for f in range(F):
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        y = np.einsum('vkc,vkc->vk', G[f, joint_indices, 1], local) + p[f, joint_indices, 1]
+        lowest[f] = (y * joint_weights).sum(1).min()
+    return lowest
+
+
 def _pad_to_4(data):
     """Pad bytes to 4-byte alignment."""
     remainder = len(data) % 4
@@ -163,7 +183,11 @@ class SMPLToGLB(io.ComfyNode):
                 io.Custom("CAMERA_TRACK").Input("camera_track", optional=True,
                     tooltip="Tracked camera (e.g. Load Nuke Camera). Exports the body and camera in the tracker's scene instead of GVHMR's world."),
                 io.Float.Input("scene_scale", default=1.0, min=0.0001, max=10000.0, step=0.01, optional=True,
-                    tooltip="Scene units per meter for camera_track. Only changes how big and far the body is in the scene, not how it lines up through the camera."),
+                    tooltip="Scene units per meter for camera_track. Only changes how big and far the body is in the scene, not how it lines up through the camera. Ignored when ground_contact is on."),
+                io.Boolean.Input("ground_contact", default=False, optional=True,
+                    tooltip="With camera_track: on frames where GVHMR detects a planted foot, set the body's depth so its lowest point sits on the ground plane (interpolated between contacts). Replaces scene_scale. Needs an NPZ from the current GVHMR Inference."),
+                io.Float.Input("ground_height", default=0.0, min=-100000.0, max=100000.0, step=0.0001, round=False, optional=True,
+                    tooltip="Height (Y) of the ground plane in the camera_track's scene units, used by ground_contact."),
             ],
             outputs=[
                 io.String.Output(display_name="glb_path"),
@@ -171,7 +195,8 @@ class SMPLToGLB(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, npz_path="", fps=30, start_frame=0, output_path="", camera_track=None, scene_scale=1.0):
+    def execute(cls, npz_path="", fps=30, start_frame=0, output_path="", camera_track=None, scene_scale=1.0,
+                ground_contact=False, ground_height=0.0):
         if not npz_path or not npz_path.strip():
             raise ValueError("npz_path is required")
         npz_file = Path(npz_path)
@@ -252,14 +277,34 @@ class SMPLToGLB(io.ComfyNode):
             if len(camera_track["R_w2c"]) < num_frames:
                 raise ValueError(f"camera_track has {len(camera_track['R_w2c'])} frames but the NPZ has {num_frames}")
             # Place the incam body through the tracked camera instead of GVHMR's world.
-            # The armature is scaled by scene_scale so GVHMR's meters become scene
-            # units, while the camera stays at its tracked position:
-            #   world = scene_scale * R_cam2world @ x_c + cam_pos
+            # The armature is scaled so GVHMR's meters become scene units, while the
+            # camera stays at its tracked position:
+            #   world = scale * R_cam2world @ x_c + cam_pos
+            # Scaling about the camera keeps the body's projection, so scale can
+            # vary per frame without breaking the plate alignment.
             R_cam2world = np.transpose(camera_track["R_w2c"][:num_frames].numpy().astype(np.float64), (0, 2, 1))
             cam_pos = -np.einsum('fij,fj->fi', R_cam2world, camera_track["t_w2c"][:num_frames].numpy())
             global_orient = (R.from_matrix(R_cam2world) * R.from_rotvec(data['global_orient_incam'])).as_rotvec()
-            transl = np.einsum('fij,fj->fi', R_cam2world, J[0] + data['transl_incam']) + cam_pos / scene_scale - J[0]
-            armature_scale = [scene_scale] * 3
+            root_c = np.einsum('fij,fj->fi', R_cam2world, J[0] + data['transl_incam'])  # pelvis relative to camera, world axes
+            if ground_contact:
+                if 'static_conf' not in data:
+                    raise ValueError("ground_contact needs an NPZ from the current GVHMR Inference (foot contact)")
+                full_pose_w = np.concatenate([global_orient.reshape(-1, 1, 3), body_pose.reshape(-1, NUM_BODY_JOINTS, 3)], axis=1)
+                lowest = _lowest_skinned_y(full_pose_w, J, positions.astype(np.float64), joint_indices, joint_weights) - J[0, 1] + root_c[:, 1]
+                contact = np.flatnonzero(data['static_conf'][:num_frames, :4].max(axis=1) > 0.5)
+                if len(contact) == 0:
+                    raise ValueError("ground_contact: GVHMR found no planted-foot frames")
+                contact_scale = (ground_height - cam_pos[contact, 1]) / lowest[contact]
+                if contact_scale.min() <= 0:
+                    raise ValueError(f"ground_contact: ground_height {ground_height} is not below the camera "
+                                     f"(camera Y {cam_pos[:, 1].min():.6g} to {cam_pos[:, 1].max():.6g})")
+                scale = np.interp(np.arange(num_frames), contact, contact_scale)
+                logger.info(f"[SMPLToGLB] ground_contact: {len(contact)}/{num_frames} contact frames, "
+                            f"scale {scale.min():.6g}-{scale.max():.6g} units/m")
+            else:
+                scale = np.full(num_frames, scene_scale)
+            transl = root_c + cam_pos / scale[:, None] - J[0]
+            armature_scale = np.repeat(scale[:, None], 3, axis=1).astype(np.float32)
             img_w, img_h = int(data['img_width'][0]), int(data['img_height'][0])
             # Nuke fits haperture to the plate width
             f_px = float(camera_track["focal_mm"][0]) / camera_track["haperture"] * img_w
@@ -393,6 +438,9 @@ class SMPLToGLB(io.ComfyNode):
             q_acc = add_accessor(q_bv, CT_FLOAT, num_frames, "VEC4")
             rot_accs.append(q_acc)
 
+        if armature_scale is not None:
+            arm_scale_acc = add_accessor(add_buffer_view(armature_scale.tobytes()), CT_FLOAT, num_frames, "VEC3")
+
         # 10. Camera translations + rotations
         if has_camera:
             cam_tl_acc = add_accessor(add_buffer_view(cam_pos.tobytes()), CT_FLOAT, num_frames, "VEC3")
@@ -413,8 +461,6 @@ class SMPLToGLB(io.ComfyNode):
             "name": "Armature",
             "children": armature_children,
         })
-        if armature_scale is not None:
-            nodes[0]["scale"] = armature_scale
 
         # Nodes 1..22: Joint nodes
         for j in range(NUM_JOINTS):
@@ -502,6 +548,10 @@ class SMPLToGLB(io.ComfyNode):
                     "path": "rotation",
                 },
             })
+
+        if armature_scale is not None:
+            channels.append({"sampler": len(samplers), "target": {"node": 0, "path": "scale"}})
+            samplers.append({"input": ts_acc, "output": arm_scale_acc, "interpolation": "LINEAR"})
 
         scene_nodes = [0]
         if has_camera:

@@ -850,6 +850,8 @@ class GVHMRInference(io.ComfyNode):
                 'transl': global_params['transl'].cpu().numpy(),
                 'global_orient_incam': incam_params['global_orient'].cpu().numpy(),
                 'transl_incam': incam_params['transl'].cpu().numpy(),
+                # [L_Ankle, L_Foot, R_Ankle, R_Foot, L_Wrist, R_Wrist] contact probability
+                'static_conf': pred["net_outputs"]["static_conf_logits"][0].float().sigmoid().cpu().numpy(),
             }
 
             # Save camera trajectory when moving camera is enabled
