@@ -243,7 +243,7 @@ class GVHMRInference(io.ComfyNode):
                 io.Boolean.Input("moving_camera", default=False,
                     tooltip="Enable if camera is moving (runs visual odometry to estimate camera motion)"),
                 io.Int.Input("focal_length_mm", default=0, min=0, max=300,
-                    tooltip="Camera focal length in mm (0 = auto-estimate). Ignored if intrinsics input is connected. Phones: 13-77mm typical",
+                    tooltip="Camera focal length in mm (0 = auto-estimate). Ignored if camera_track or intrinsics input is connected. Phones: 13-77mm typical",
                     optional=True),
                 io.Float.Input("bbox_scale", default=1.2, min=1.0, max=2.0, step=0.1,
                     tooltip="Expand bounding box by this factor to ensure full person capture",

@@ -24,6 +24,7 @@ from .smpl_retarget_node import SMPLRetargetToSMPL
 from .smpl_to_mixamo_node import SMPLToMixamo
 from .rest_pose_node import ExtractRestPose
 from .glb_export_node import SMPLToGLB
+from .abc_export_node import GLBToAlembic
 
 # Viewer nodes
 from .viewer_node import NODE_CLASS_MAPPINGS as viewer_mappings
@@ -55,6 +56,7 @@ NODE_CLASS_MAPPINGS = {
     "SMPLToMixamo": SMPLToMixamo,
     "ExtractRestPose": ExtractRestPose,
     "SMPLToGLB": SMPLToGLB,
+    "GLBToAlembic": GLBToAlembic,
     # Viewer nodes
     **viewer_mappings,
     **camera_viewer_mappings,
@@ -84,6 +86,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SMPLToMixamo": "SMPL to Mixamo",
     "ExtractRestPose": "Extract Rest Pose",
     "SMPLToGLB": "SMPL to GLB Animation",
+    "GLBToAlembic": "GLB to Alembic",
     # Viewer nodes
     **viewer_display,
     **camera_viewer_display,
