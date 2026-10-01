@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation as R
 import folder_paths
 
@@ -188,6 +189,8 @@ class SMPLToGLB(io.ComfyNode):
                     tooltip="With camera_track: on frames where GVHMR detects a planted foot, set the body's depth so its lowest point sits on the ground plane (interpolated between contacts). Replaces scene_scale. Needs an NPZ from the current GVHMR Inference."),
                 io.Float.Input("ground_height", default=0.0, min=-100000.0, max=100000.0, step=0.0001, round=False, optional=True,
                     tooltip="Height (Y) of the ground plane in the camera_track's scene units, used by ground_contact."),
+                io.Float.Input("smoothing", default=2.0, min=0.0, max=30.0, step=0.5, optional=True,
+                    tooltip="With camera_track: Gaussian sigma in frames applied to the body's root position and rotation in the scene, and to the ground_contact scale. GVHMR's camera-space estimate is per frame and jitters, mostly in depth. 0 = off."),
             ],
             outputs=[
                 io.String.Output(display_name="glb_path"),
@@ -196,7 +199,7 @@ class SMPLToGLB(io.ComfyNode):
 
     @classmethod
     def execute(cls, npz_path="", fps=30, start_frame=0, output_path="", camera_track=None, scene_scale=1.0,
-                ground_contact=False, ground_height=0.0):
+                ground_contact=False, ground_height=0.0, smoothing=2.0):
         if not npz_path or not npz_path.strip():
             raise ValueError("npz_path is required")
         npz_file = Path(npz_path)
@@ -284,7 +287,16 @@ class SMPLToGLB(io.ComfyNode):
             # vary per frame without breaking the plate alignment.
             R_cam2world = np.transpose(camera_track["R_w2c"][:num_frames].numpy().astype(np.float64), (0, 2, 1))
             cam_pos = -np.einsum('fij,fj->fi', R_cam2world, camera_track["t_w2c"][:num_frames].numpy())
-            global_orient = (R.from_matrix(R_cam2world) * R.from_rotvec(data['global_orient_incam'])).as_rotvec()
+            root_rot = R.from_matrix(R_cam2world) * R.from_rotvec(data['global_orient_incam'])
+            if smoothing > 0:
+                # GVHMR's incam root is an independent estimate per frame, unlike its
+                # integrated global trajectory, so it is filtered here in scene space.
+                q = root_rot.as_quat()
+                flip = np.sign((q[1:] * q[:-1]).sum(axis=1))
+                flip[flip == 0] = 1
+                q[1:] *= np.cumprod(flip)[:, None]
+                root_rot = R.from_quat(gaussian_filter1d(q, smoothing, axis=0, mode="nearest"))
+            global_orient = root_rot.as_rotvec()
             root_c = np.einsum('fij,fj->fi', R_cam2world, J[0] + data['transl_incam'])  # pelvis relative to camera, world axes
             if ground_contact:
                 if 'static_conf' not in data:
@@ -299,11 +311,16 @@ class SMPLToGLB(io.ComfyNode):
                     raise ValueError(f"ground_contact: ground_height {ground_height} is not below the camera "
                                      f"(camera Y {cam_pos[:, 1].min():.6g} to {cam_pos[:, 1].max():.6g})")
                 scale = np.interp(np.arange(num_frames), contact, contact_scale)
+                if smoothing > 0:
+                    scale = gaussian_filter1d(scale, smoothing, mode="nearest")
                 logger.info(f"[SMPLToGLB] ground_contact: {len(contact)}/{num_frames} contact frames, "
                             f"scale {scale.min():.6g}-{scale.max():.6g} units/m")
             else:
                 scale = np.full(num_frames, scene_scale)
-            transl = root_c + cam_pos / scale[:, None] - J[0]
+            pelvis = cam_pos + scale[:, None] * root_c
+            if smoothing > 0:
+                pelvis = gaussian_filter1d(pelvis, smoothing, axis=0, mode="nearest")
+            transl = pelvis / scale[:, None] - J[0]
             armature_scale = np.repeat(scale[:, None], 3, axis=1).astype(np.float32)
             img_w, img_h = int(data['img_width'][0]), int(data['img_height'][0])
             # Nuke fits haperture to the plate width
