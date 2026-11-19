@@ -437,9 +437,12 @@ class GVHMRInference(io.ComfyNode):
         width, height = video.get_dimensions()
         mask_width, mask_height = video_mask.get_dimensions()
 
-        if video_frame_count != mask_frame_count:
-            Log.warn(f"[GVHMRInference] Video frames ({video_frame_count}) != mask frames ({mask_frame_count}). Using minimum.")
-        batch_size = min(video_frame_count, mask_frame_count)
+        if mask_frame_count < video_frame_count:
+            raise ValueError(f"video_mask has {mask_frame_count} frames but the video has {video_frame_count}; "
+                             "the mask needs a frame for every video frame")
+        if mask_frame_count > video_frame_count:
+            Log.warn(f"[GVHMRInference] Mask has {mask_frame_count} frames, using the first {video_frame_count} to match the video")
+        batch_size = video_frame_count
 
         Log.info(f"[GVHMRInference] Video: {video_frame_count} frames @ {width}x{height}")
         Log.info(f"[GVHMRInference] Mask: {mask_frame_count} frames @ {mask_width}x{mask_height}")
@@ -929,10 +932,8 @@ class GVHMRInference(io.ComfyNode):
             return io.NodeOutput(str(npz_path), camera_npz_path_str, info)
 
         except Exception as e:
-            error_msg = f"GVHMR Inference failed: {str(e)}"
-            Log.error(error_msg, exc_info=True)
-            # Return placeholder on error
-            return io.NodeOutput("", "", error_msg)
+            Log.error(f"GVHMR Inference failed: {e}", exc_info=True)
+            raise
 
 
 
